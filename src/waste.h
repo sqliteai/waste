@@ -70,6 +70,7 @@ typedef enum {
     WASTE_E_ARG = -5,
     WASTE_E_UNSUPPORTED = -6,  /* arch/quant combination not built in      */
     WASTE_E_CANCELLED = -7,    /* callback asked to stop                   */
+    WASTE_E_BUSY = -8,         /* another process owns this container      */
 } waste_status;
 
 /* Human-readable, static storage; never NULL. A coarse answer by design:
@@ -222,6 +223,13 @@ typedef struct {
      * expert this container does not have are skipped, because it is one
      * of the few files the engine reads that nobody asked it to. */
     const char *usage_path;
+
+    /* On POSIX hosts, one process owns a container at a time by default.
+     * Multiple contexts in that process share the ownership; a competing
+     * process receives WASTE_E_BUSY before model-sized allocations begin.
+     * Set this only when the host deliberately accepts competing loads.
+     * It is ignored on platforms without the ownership lock. */
+    int allow_concurrent_open;
 } waste_cfg;
 
 /* Removed in 0.6.0, having never done anything: `io_threads` (there is no

@@ -11,6 +11,7 @@
 
 #include "waste.h"
 
+#include <errno.h>
 #include <limits.h>
 #include <math.h>
 #include <stdio.h>
@@ -21,6 +22,12 @@
 #include <sys/sysctl.h>
 #endif
 #include <time.h>
+#if !defined(_WIN32)
+#include <fcntl.h>
+#include <pthread.h>
+#include <sys/file.h>
+#include <sys/stat.h>
+#endif
 
 #include "json.h"
 #include "memory.h"
@@ -28,6 +35,8 @@
 #include "platform.h"
 #include "tokenizer.h"
 #include "waste_backend.h"
+
+typedef struct waste_model_lock waste_model_lock;
 
 struct waste_ctx {
     waste_model m;
@@ -41,6 +50,7 @@ struct waste_ctx {
     char quant[64];          /* composed at open, reported by get_info */
     char detail[128];        /* which record failed, for waste_error_detail */
     waste_stats stats;
+    waste_model_lock *model_lock;
 
     /* Queued image embeddings, concatenated: img_each[] is how many rows
      * each queued image contributed, which is what expand needs to know
@@ -50,6 +60,143 @@ struct waste_ctx {
     size_t   img_each[WASTE_MAX_IMAGES];
     int      img_n;
 };
+
+#if !defined(_WIN32)
+struct waste_model_lock {
+    dev_t dev;
+    ino_t ino;
+    int fd;
+    unsigned refs;
+    pid_t owner;
+    waste_model_lock *next;
+};
+
+static pthread_mutex_t model_lock_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_once_t model_lock_once = PTHREAD_ONCE_INIT;
+static waste_model_lock *model_locks;
+
+/* A forked child is a competing process, not another context in its parent.
+ * Close its inherited copies before it can consult the copied registry. The
+ * entries themselves remain allocated in the child: free is not async-signal
+ * safe, and inherited contexts ignore entries owned by a different pid. */
+static void model_lock_atfork_prepare(void)
+{
+    pthread_mutex_lock(&model_lock_mu);
+}
+
+static void model_lock_atfork_parent(void)
+{
+    pthread_mutex_unlock(&model_lock_mu);
+}
+
+static void model_lock_atfork_child(void)
+{
+    for (waste_model_lock *p = model_locks; p; p = p->next) close(p->fd);
+    model_locks = NULL;
+    pthread_mutex_unlock(&model_lock_mu);
+}
+
+static void model_lock_init(void)
+{
+    (void)pthread_atfork(model_lock_atfork_prepare, model_lock_atfork_parent,
+                         model_lock_atfork_child);
+}
+
+/* One OS lock per container and process. Device/inode identity means aliases
+ * of the same directory share an entry. The registry supplies the reference
+ * semantics flock does not: closing one context must not release ownership
+ * while another context in this process still uses the container. */
+static waste_model_lock *model_lock_acquire(const char *path, int allow,
+                                            waste_status *status)
+{
+    *status = WASTE_OK;
+    if (allow) return NULL;
+
+    pthread_once(&model_lock_once, model_lock_init);
+    int flags = O_RDONLY;
+#ifdef O_CLOEXEC
+    flags |= O_CLOEXEC;
+#endif
+    const int fd = open(path, flags);
+    if (fd < 0) { *status = WASTE_E_IO; return NULL; }
+#ifndef O_CLOEXEC
+    const int fdflags = fcntl(fd, F_GETFD);
+    if (fdflags < 0 || fcntl(fd, F_SETFD, fdflags | FD_CLOEXEC)) {
+        close(fd);
+        *status = WASTE_E_IO;
+        return NULL;
+    }
+#endif
+    struct stat st;
+    if (fstat(fd, &st)) { close(fd); *status = WASTE_E_IO; return NULL; }
+
+    pthread_mutex_lock(&model_lock_mu);
+    for (waste_model_lock *p = model_locks; p; p = p->next) {
+        if (p->dev == st.st_dev && p->ino == st.st_ino) {
+            p->refs++;
+            pthread_mutex_unlock(&model_lock_mu);
+            close(fd);
+            return p;
+        }
+    }
+
+    int rc;
+    do rc = flock(fd, LOCK_EX | LOCK_NB); while (rc && errno == EINTR);
+    if (rc) {
+        const int busy = errno == EWOULDBLOCK || errno == EAGAIN;
+        pthread_mutex_unlock(&model_lock_mu);
+        close(fd);
+        *status = busy ? WASTE_E_BUSY : WASTE_E_IO;
+        return NULL;
+    }
+
+    waste_model_lock *p = (waste_model_lock *)calloc(1, sizeof *p);
+    if (!p) {
+        (void)flock(fd, LOCK_UN);
+        pthread_mutex_unlock(&model_lock_mu);
+        close(fd);
+        *status = WASTE_E_OOM;
+        return NULL;
+    }
+    p->dev = st.st_dev;
+    p->ino = st.st_ino;
+    p->fd = fd;
+    p->refs = 1;
+    p->owner = getpid();
+    p->next = model_locks;
+    model_locks = p;
+    pthread_mutex_unlock(&model_lock_mu);
+    return p;
+}
+
+static void model_lock_release(waste_model_lock *entry)
+{
+    if (!entry || entry->owner != getpid()) return;
+    pthread_mutex_lock(&model_lock_mu);
+    if (--entry->refs == 0) {
+        waste_model_lock **pp = &model_locks;
+        while (*pp && *pp != entry) pp = &(*pp)->next;
+        if (*pp) *pp = entry->next;
+        (void)flock(entry->fd, LOCK_UN);
+        close(entry->fd);
+        free(entry);
+    }
+    pthread_mutex_unlock(&model_lock_mu);
+}
+#else
+/* Keep non-POSIX lifecycle behavior unchanged. The public opt-out is ignored
+ * on hosts where this advisory ownership lock is not implemented. */
+struct waste_model_lock { int unused; };
+static waste_model_lock *model_lock_acquire(const char *path, int allow,
+                                            waste_status *status)
+{
+    (void)path;
+    (void)allow;
+    *status = WASTE_OK;
+    return NULL;
+}
+static void model_lock_release(waste_model_lock *entry) { (void)entry; }
+#endif
 
 
 
@@ -87,6 +234,7 @@ const char *waste_strerror(waste_status s)
     case WASTE_E_ARG:          return "invalid argument";
     case WASTE_E_UNSUPPORTED:  return "unsupported";
     case WASTE_E_CANCELLED:    return "cancelled by callback";
+    case WASTE_E_BUSY:         return "container is already open in another process";
     }
     return "unknown error";
 }
@@ -408,8 +556,17 @@ waste_status waste_open(const char *model_path, const waste_cfg *cfg_in,
     c->cfg = cfg;
     snprintf(c->path, sizeof c->path, "%s", model_path);
 
+    waste_status lock_status = WASTE_OK;
+    c->model_lock = model_lock_acquire(model_path, cfg.allow_concurrent_open,
+                                       &lock_status);
+    if (lock_status != WASTE_OK) { free(c); return lock_status; }
+
     waste_status st = waste_plan_memory(model_path, cfg.ctx_tokens, &c->plan);
-    if (st != WASTE_OK) { free(c); return st; }
+    if (st != WASTE_OK) {
+        model_lock_release(c->model_lock);
+        free(c);
+        return st;
+    }
 
     /* Optional vision weights, decode buffers, tower activations and queued
      * embeddings are real memory, so all of them enter the floor. */
@@ -457,7 +614,11 @@ waste_status waste_open(const char *model_path, const waste_cfg *cfg_in,
             if (!cap || b <= cap) { budget = b; break; }
         }
     }
-    if (budget < c->plan.floor_bytes) { free(c); return WASTE_E_RAM_BUDGET; }
+    if (budget < c->plan.floor_bytes) {
+        model_lock_release(c->model_lock);
+        free(c);
+        return WASTE_E_RAM_BUDGET;
+    }
 
     /* A budget close to physical RAM backfires: the OS starts paging out
      * the engine's own expert cache, and a "hit" then costs a page fault
@@ -495,6 +656,7 @@ waste_status waste_open(const char *model_path, const waste_cfg *cfg_in,
              * fail, and freeing only the context left all of it behind —
              * on K3 that is tens of gigabytes lost to one bad manifest. */
             waste_model_free(&c->m);
+            model_lock_release(c->model_lock);
             free(c);
             return rc == -2 ? WASTE_E_FORMAT : WASTE_E_IO;
         }
@@ -524,6 +686,7 @@ void waste_close(waste_ctx *c)
     waste_model_free(&c->m);
     waste_tok_free(c->tok);
     free(c->img);
+    model_lock_release(c->model_lock);
     free(c);
 }
 

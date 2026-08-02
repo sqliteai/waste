@@ -228,7 +228,7 @@ waste$(EXE): cli/main.o libwaste.a
 # the two failures tests/run.sh was written to catch, so a binary that
 # `test` builds and `clean` forgets defeats the check meant to notice it.
 TESTNAMES := test_kda test_container test_forward test_tokenizer test_k3parts \
-             test_state test_vision test_image test_memory test_cpus sweep
+             test_state test_vision test_image test_memory test_cpus test_lock sweep
 TESTBINS  := $(addsuffix $(EXE),$(TESTNAMES))
 
 test: $(TESTBINS)
@@ -272,6 +272,9 @@ test_memory$(EXE): tests/test_memory.o src/memory.o
 # it can check placement without a container, and the parse half of it runs
 # on the platforms that cannot bind a thread.
 test_cpus$(EXE): tests/test_cpus.o
+	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
+
+test_lock$(EXE): tests/test_lock.o libwaste.a
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
 
 %.o: %.c

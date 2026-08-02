@@ -44,6 +44,7 @@ WASTE_E_OOM = -4
 WASTE_E_ARG = -5
 WASTE_E_UNSUPPORTED = -6
 WASTE_E_CANCELLED = -7
+WASTE_E_BUSY = -8
 
 # waste.h's waste_cache_policy. There is no third: a "pinned" policy was
 # listed there and never implemented, so it selected LFRU like everything
@@ -87,7 +88,8 @@ class Cfg(C.Structure):
                 ("use_direct_io", C.c_int),
                 ("vision", C.c_int),
                 ("verify_records", C.c_int),
-                ("usage_path", C.c_char_p)]
+                ("usage_path", C.c_char_p),
+                ("allow_concurrent_open", C.c_int)]
 
 
 class GenParams(C.Structure):
@@ -378,7 +380,8 @@ class Engine:
                  direct_io: bool = True,
                  vision: bool = False,
                  verify_records: bool = False,
-                 usage_path: Optional[str] = None):
+                 usage_path: Optional[str] = None,
+                 allow_concurrent_open: bool = False):
         ram_budget_bytes = _bounded_int(
             "ram_budget_bytes", ram_budget_bytes, 0, (1 << 64) - 1)
         ctx_tokens = _bounded_int("ctx_tokens", ctx_tokens, 0, (1 << 32) - 1)
@@ -408,6 +411,7 @@ class Engine:
         # and a temporary would be freed before waste_open reads it.
         self._usage = usage_path.encode() if usage_path else None
         cfg.usage_path = self._usage
+        cfg.allow_concurrent_open = 1 if allow_concurrent_open else 0
 
         st = self.lib.waste_open(self.model_path.encode(), C.byref(cfg),
                                  C.byref(self._ctx))

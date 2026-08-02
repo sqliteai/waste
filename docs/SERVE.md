@@ -292,6 +292,8 @@ python3 -m serve MODEL [options]
   --vision           load the vision tower
   --verify           check every expert record's crc32 as it is read
   --usage PATH       learned hotlist (default <model>/usage.waste)
+  --allow-concurrent-open
+                      opt out of the POSIX per-container process lock
   --max-tokens N     default cap when a request does not set one (4096)
   --no-thinking      answer without the think channel unless asked
   --allow-local-images
