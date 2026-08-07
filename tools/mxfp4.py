@@ -53,6 +53,29 @@ def dequant(packed: torch.Tensor, scale: torch.Tensor, group: int = GROUP):
 
 # ------------------------------------------------------------------ I/O ---
 
+def unblock_scale(q, scale, block):
+    """fp8 block dequant: q [M, N] f32, scale [ceil(M/bm), ceil(N/bn)] -> q * scale.
+
+    `block` must come from the checkpoint's config (quantization_config.
+    weight_block_size), NOT be inferred from the two shapes. Inferring looks
+    possible and is wrong whenever a dimension is not a multiple of the tile: 300
+    rows with 3 scale rows admits both 128 (the truth, with a partial last tile)
+    and 100 (a clean split), and the wrong one silently applies each scale to the
+    wrong rows. The shapes agree in both readings, so nothing downstream notices.
+    """
+    if q.ndim != 2 or scale.ndim != 2:
+        raise ValueError(f"fp8 block dequant expects 2-D, got {tuple(q.shape)} "
+                         f"and {tuple(scale.shape)}")
+    bm, bn = block
+    M, N = q.shape
+    want = (-(-M // bm), -(-N // bn))
+    if tuple(scale.shape) != want:
+        raise ValueError(f"fp8 scale {tuple(scale.shape)} does not match "
+                         f"{tuple(q.shape)} at block {tuple(block)}; expected {want}")
+    full = scale.repeat_interleave(bm, 0).repeat_interleave(bn, 1)[:M, :N]
+    return q * full
+
+
 class ST:
     """safetensors reader that also understands the packed pairs."""
 
@@ -65,6 +88,16 @@ class ST:
         # the downloader has verified are safe to read.
         state = os.path.join(model_dir, ".download-state")
         self.ready = set(open(state).read().split()) if os.path.exists(state) else None
+        # fp8 block size is a property of the checkpoint, stated in its config.
+        # Default 128x128 only so a config-less directory still reads; a real fp8
+        # checkpoint always declares it.
+        self.fp8_block = (128, 128)
+        cfgp = os.path.join(model_dir, "config.json")
+        if os.path.exists(cfgp):
+            qc = (json.load(open(cfgp)).get("quantization_config") or {})
+            wbs = qc.get("weight_block_size")
+            if wbs:
+                self.fp8_block = tuple(wbs)
 
     def _header(self, fn):
         if fn not in self._hdr:
@@ -90,13 +123,31 @@ class ST:
             f.seek(base + beg)
             buf = bytearray(f.read(end - beg))
         dt = {"U8": torch.uint8, "I8": torch.int8, "BF16": torch.bfloat16,
-              "F16": torch.float16, "F32": torch.float32}[meta["dtype"]]
+              "F16": torch.float16, "F32": torch.float32,
+              # fp8 is how the current generation of large MoEs ships — K2,
+              # DeepSeek V3/R1. The values are read natively; the per-block
+              # scales they need are applied in tensor(), not here, because
+              # raw() is by contract the bytes as stored.
+              "F8_E4M3": torch.float8_e4m3fn,
+              "F8_E5M2": torch.float8_e5m2}[meta["dtype"]]
         return torch.frombuffer(buf, dtype=dt).view(*meta["shape"])
 
     def tensor(self, name):
-        """Returns f32, transparently dequantizing an mxfp4 pair."""
+        """Returns f32, transparently dequantizing an mxfp4 pair or fp8 blocks."""
         if self.have(name):
-            return self.raw(name).float()
+            t = self.raw(name)
+            # fp8 checkpoints carry one f32 scale per weight_block_size tile in a
+            # companion tensor. Without it the values are off by up to the scale's
+            # dynamic range — silently, since the shapes still line up.
+            if t.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+                if not self.have(name + "_scale_inv"):
+                    raise KeyError(
+                        f"{name} is {t.dtype} but {name}_scale_inv is missing; "
+                        "refusing to read fp8 without its block scales")
+                return unblock_scale(t.float(),
+                                     self.raw(name + "_scale_inv").float(),
+                                     self.fp8_block)
+            return t.float()
         if self.have(name + "_packed"):
             return dequant(self.raw(name + "_packed"), self.raw(name + "_scale"))
         raise KeyError(name)

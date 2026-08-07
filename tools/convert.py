@@ -86,7 +86,7 @@ def atomic_text(path, value):
     os.replace(tmp, path)
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from mxfp4 import ST                                            # noqa: E402
+from mxfp4 import ST, unblock_scale                             # noqa: E402
 
 # --- native VQ encoder (optional; ~15x the torch path) --------------------
 _VQ = None
@@ -125,7 +125,81 @@ VEC_DIM = 8
 CB_ENTRIES = 256
 TRAIN_VECTORS = 300000       # vectors k-means sees per (layer, matrix kind)
 IDX_BLOCK = 64          # rows per index block; matches VQ_TILE in the engine
-KINDS = (("gate", "w1"), ("up", "w3"), ("down", "w2"))   # Mixtral naming
+# Two MoE tensor namings exist in this family and they are not compatible:
+#
+#   Mixtral / Kimi-Linear / K3   layers.L.block_sparse_moe.experts.E.{w1,w3,w2}.weight
+#   DeepSeek / Kimi K2           layers.L.mlp.experts.E.{gate,up,down}_proj.weight
+#
+# The engine only knows the first one — it looks up the router, the shared experts and
+# the score-correction bias under `block_sparse_moe` (src/model.c:2532 among others).
+# So a DeepSeek-named checkpoint is READ under its own names and WRITTEN under the
+# engine's. Detected per checkpoint, never flagged: a flag is a thing to get wrong, and
+# `st.have()` already knows the answer.
+#
+# `kind` is what this file calls the matrix; `tag` is the suffix the source uses.
+MOE_LAYOUTS = (
+    # name        moe segment          gate/up/down source tags
+    ("mixtral",   "block_sparse_moe",  ("w1", "w3", "w2")),
+    ("deepseek",  "mlp",               ("gate_proj", "up_proj", "down_proj")),
+)
+KIND_ORDER = ("gate", "up", "down")
+KINDS = tuple(zip(KIND_ORDER, MOE_LAYOUTS[0][2]))   # default: Mixtral naming
+
+# The two families disagree on MoE *config* keys as well as on tensor names,
+# and this half is the more dangerous one: the engine reads `num_experts` and
+# a DeepSeek config only spells it `n_routed_experts`, so it loads 0 experts
+# and refuses the container with no diagnostic — after the conversion has
+# already run. `num_experts_per_tok` vs `..._per_token` is one letter and
+# would leave top_k at 0.
+#
+# The manifest is WASTE's format, not HF's, so it is normalised here for the
+# same reason the tensor names are: one spelling reaches the engine. Written
+# only when absent, so a config that already uses the canonical key wins.
+CONFIG_ALIASES = (
+    ("num_experts",           "n_routed_experts"),
+    ("num_experts_per_token", "num_experts_per_tok"),
+    ("num_shared_experts",    "n_shared_experts"),
+)
+# `moe_renormalize` is keyed on the field being PRESENT, not on its value, so
+# a plain alias of DeepSeek's `norm_topk_prob` would silently turn
+# renormalisation on for a checkpoint that sets it false. Emit only when true.
+CONFIG_FLAG_ALIASES = (("moe_renormalize", "norm_topk_prob"),)
+
+
+def normalise_cfg(cfg):
+    """A copy of the HF config with MoE keys under the names the engine reads."""
+    out = dict(cfg)
+    for canon, hf in CONFIG_ALIASES:
+        if canon not in out and hf in out:
+            out[canon] = out[hf]
+    for canon, hf in CONFIG_FLAG_ALIASES:
+        if canon not in out and out.get(hf):
+            out[canon] = True
+    return out
+
+
+def moe_layout(st, prefix, layer):
+    """Which of MOE_LAYOUTS this checkpoint uses, from what is actually on disk."""
+    for name, seg, tags in MOE_LAYOUTS:
+        probe = f"{prefix}model.layers.{layer}.{seg}.experts.0.{tags[0]}.weight"
+        if st.have(probe) or st.have(probe + "_packed"):
+            return name, seg, tuple(zip(KIND_ORDER, tags))
+    return None, None, None
+
+
+# Trunk tensors the engine expects under `block_sparse_moe` but a DeepSeek checkpoint
+# ships under `mlp`. The router gate and the shared experts, not the dense-layer FFN:
+# `mlp.gate.weight` and `mlp.shared_experts.*` are MoE, while `mlp.gate_proj.weight`
+# is layer 0's dense FFN and the engine wants that one left exactly where it is.
+def trunk_rename(name, seg):
+    if seg != "mlp":
+        return name
+    for tail in (".mlp.gate.weight", ".mlp.gate.e_score_correction_bias"):
+        if name.endswith(tail):
+            return name[: -len(tail)] + tail.replace(".mlp.", ".block_sparse_moe.", 1)
+    if ".mlp.shared_experts." in name:
+        return name.replace(".mlp.shared_experts.", ".block_sparse_moe.shared_experts.", 1)
+    return name
 
 
 # ---------------------------------------------------------------- reading --
@@ -138,6 +212,15 @@ class ShardReader:
         idx = json.load(open(os.path.join(model_dir, "model.safetensors.index.json")))
         self.wm = idx["weight_map"]
         self._hdr = {}
+        # fp8 block size is a property of the checkpoint and is stated in its
+        # config; it must not be inferred from the weight/scale shape ratio,
+        # which is ambiguous whenever a dimension is not a multiple of the tile.
+        self.fp8_block = (128, 128)
+        cfgp = os.path.join(model_dir, "config.json")
+        if os.path.exists(cfgp):
+            qc = (json.load(open(cfgp)).get("quantization_config") or {})
+            if qc.get("weight_block_size"):
+                self.fp8_block = tuple(qc["weight_block_size"])
 
     def _header(self, fn):
         if fn not in self._hdr:
@@ -158,8 +241,22 @@ class ShardReader:
             f.seek(base + beg)
             raw = f.read(end - beg)
         dt = {"BF16": torch.bfloat16, "F16": torch.float16,
-              "F32": torch.float32}[meta["dtype"]]
-        return torch.frombuffer(bytearray(raw), dtype=dt).view(*meta["shape"]).float()
+              "F32": torch.float32,
+              # The current generation of large MoEs ships fp8 with one f32
+              # scale per weight_block_size tile in a companion tensor (K2,
+              # DeepSeek V3/R1). Reading the values without applying those
+              # scales yields plausible-looking garbage, so a missing companion
+              # is an error rather than a fallback.
+              "F8_E4M3": torch.float8_e4m3fn,
+              "F8_E5M2": torch.float8_e5m2}[meta["dtype"]]
+        t = torch.frombuffer(bytearray(raw), dtype=dt).view(*meta["shape"])
+        if dt in (torch.float8_e4m3fn, torch.float8_e5m2):
+            sname = name + "_scale_inv"
+            if sname not in self.wm:
+                raise KeyError(f"{name} is {meta['dtype']} but {sname} is missing; "
+                               "refusing to read fp8 without its block scales")
+            return unblock_scale(t.float(), self.get(sname), self.fp8_block)
+        return t.float()
 
 
 # ------------------------------------------------------------ quantizers --
@@ -614,19 +711,20 @@ def convert_layer(job):
     st = ST(src)
     dev = torch.device(device)
 
-    def ename(e, tag):
-        return f"{prefix}model.layers.{L}.block_sparse_moe.experts.{e}.{tag}.weight"
-
-    if not (st.have(ename(0, "w1")) or st.have(ename(0, "w1") + "_packed")):
+    lname, seg, kinds = moe_layout(st, prefix, L)
+    if lname is None:
         return (L, 0, cb_base, "missing")
 
+    def ename(e, tag):
+        return f"{prefix}model.layers.{L}.{seg}.experts.{e}.{tag}.weight"
+
     t0 = _t.time()
-    shapes = [tuple(st.tensor(ename(0, tag)).shape) for _, tag in KINDS]
+    shapes = [tuple(st.tensor(ename(0, tag)).shape) for _, tag in kinds]
 
     books, sample_ids = {}, list(range(0, n_exp, max(1, n_exp // cb_sample)))[:cb_sample]
     per = max(1, TRAIN_VECTORS // len(sample_ids))
     with open(cbf + ".tmp", "wb") as cf:
-        for ki, (kind, tag) in enumerate(KINDS):
+        for ki, (kind, tag) in enumerate(kinds):
             chunks = []
             for e in sample_ids:
                 W = st.tensor(ename(e, tag))
@@ -649,7 +747,7 @@ def convert_layer(job):
     with open(bank + ".tmp", "wb") as f:
         for e in range(n_exp):
             payloads, scales = [], []
-            for kind, tag in KINDS:
+            for kind, tag in kinds:
                 W = st.tensor(ename(e, tag))
                 idx, sc = quantize_vq(W, books[kind], dev, entries=entries)
                 payloads.append(idx); scales.append(sc)
@@ -672,6 +770,12 @@ def build_trunk(args, sr, st, existing, manifest_path):
     trunk_path = os.path.join(args.out, "trunk.bin")
     trunk_tmp = trunk_path + ".tmp"
     tindex = []
+    # Which MoE naming this checkpoint uses. Read from the names themselves rather than
+    # probed: build_trunk takes no prefix to build a probe with, and the index already
+    # says. Only affects what the router and shared experts are WRITTEN as — see
+    # trunk_rename.
+    _trunk_seg = ("mlp" if any(".mlp.experts." in n for n in sr.names())
+                  else "block_sparse_moe")
     if args.skip_trunk:
         # "The trunk is unchanged between runs" — so carry its published
         # index forward and still publish. Returning here instead left the
@@ -702,6 +806,7 @@ def build_trunk(args, sr, st, existing, manifest_path):
                 if not st.have(name):
                     continue                  # shard not downloaded yet
                 t = st.tensor(name)
+                name = trunk_rename(name, _trunk_seg)
                 off = tf.tell()
                 if t.dim() == 1 or t.numel() < 1 << 16:
                     tf.write(raw_bytes(t.float()))
@@ -920,8 +1025,19 @@ def main():
         manifest_layers = {}
 
 
+    # Layout is a property of the checkpoint, so probe once on the first MoE layer
+    # rather than per layer: a per-layer probe would mask a checkpoint that mixes them,
+    # which would be a corrupt source rather than a shape to support.
+    _lname, _seg, _kinds = (None, None, None)
+    for _L in range(n_layers):
+        _lname, _seg, _kinds = moe_layout(st, prefix, _L)
+        if _lname:
+            break
+    if _lname is None:
+        _seg, _kinds = MOE_LAYOUTS[0][1], KINDS
+
     def ename(L, e, tag):
-        return f"{prefix}model.layers.{L}.block_sparse_moe.experts.{e}.{tag}.weight"
+        return f"{prefix}model.layers.{L}.{_seg}.experts.{e}.{tag}.weight"
 
     n_cb_per_layer = 3 * args.stages
     next_base = old_books
@@ -955,8 +1071,9 @@ def main():
                     and os.path.getsize(bank) > 0):
                 base = recovered
                 cached_ok = True
-        source_ok = (st.have(ename(L, 0, "w1")) or
-                     st.have(ename(L, 0, "w1") + "_packed"))
+        _t0 = _kinds[0][1]
+        source_ok = (st.have(ename(L, 0, _t0)) or
+                     st.have(ename(L, 0, _t0) + "_packed"))
         if not cached_ok:
             base = next_base
             if source_ok:
@@ -1231,7 +1348,7 @@ def main():
         "format_version": 0,
         "arch": arch,
         "tensor_prefix": prefix,
-        "config": cfg,
+        "config": normalise_cfg(cfg),
         # The record's fmt byte is FMT_VQ3R for every stage count but 2 — the
         # engine takes the stage and entry counts from here, not from the
         # byte, and only refuses a fmt that is neither VQ3R nor VQ2R.

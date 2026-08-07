@@ -97,6 +97,10 @@ def install_stubs():
         def tensor(self, name): return FakeTensor()
         def names(self): return [TRUNK_TENSOR]
     mx.ST = ST
+    # convert.py imports this alongside ST for fp8 block-scaled checkpoints.
+    # Resume never reaches a dequant, but the stub has to satisfy the import
+    # or every check in this file fails at module load.
+    mx.unblock_scale = lambda q, scale, block: q
     sys.modules["mxfp4"] = mx
     sys.path.insert(0, os.path.join(REPO, "tools"))
     import convert
