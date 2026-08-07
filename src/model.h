@@ -58,6 +58,11 @@ typedef struct {
  * across a hidden state, and one global scale would flatten the small
  * positions to zero. */
 #define WASTE_VQ_LUT_BLK 32
+
+/* Rotary pairs held per layer: qk_rope_head_dim / 2. 64 covers a 128-wide
+ * rope slice; every model in the family uses 64. A container needing
+ * rotation on a wider slice is refused at load rather than run unrotated. */
+#define WASTE_MAX_ROPE_HALF 64
     int kda_layer[WASTE_MAX_LAYERS]; /* 1 if layer is KDA                   */
     float eps, routed_scale;
     int renorm;
@@ -81,6 +86,20 @@ typedef struct {
      * themselves model_type "kimi_linear", so this is the only field that
      * tells them apart by name rather than by feature. */
     char  arch[64];
+
+    /* --- rotary -------------------------------------------------------- */
+    /* The Kimi models set mla_use_nope and are the reason this was absent:
+     * with NoPE the qk_rope dims pass through unrotated. Every DeepSeek-V3
+     * model (V3, R1, K2) sets no such flag and needs the rotation, and in
+     * MLA those dims are the only positional signal — the nope dims are
+     * position-free by construction, so skipping it leaves attention unable
+     * to order the sequence. */
+    int   mla_nope;                  /* mla_use_nope: 1 = no rotation       */
+    float rope_inv_freq[WASTE_MAX_ROPE_HALF];   /* qk_rope/2 used, YaRN-adjusted */
+    float att_mul;                   /* YaRN mscale^2 on the attn scale, 1 = none */
+    char  rope_err[128];             /* non-empty: a shape rope_init does not
+                                      * implement, and why. The load refuses on
+                                      * it rather than running unrotated.    */
 } waste_config;
 
 typedef struct {

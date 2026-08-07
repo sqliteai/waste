@@ -208,6 +208,14 @@ static inline int64_t js_int(const js_doc *d, int t, int64_t dflt)
     return (int64_t)v;
 }
 
+/* Reads a value, not a presence: `false` is false, and anything that is not
+ * a JSON boolean — including a missing key — is dflt. */
+static inline int js_bool(const js_doc *d, int t, int dflt)
+{
+    if (t < 0 || t >= d->n || d->tok[t].type != JS_BOOL) return dflt;
+    return d->src[d->tok[t].start] == 't';
+}
+
 /* Copies at most cap-1 bytes; always NUL-terminates. */
 static inline const char *js_str(const js_doc *d, int t, char *buf, size_t cap)
 {

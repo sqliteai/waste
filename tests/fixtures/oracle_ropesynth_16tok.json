@@ -1,0 +1,8 @@
+{
+ "container": "python3 tools/make_test_container.py --rope --seed 0 <dir>",
+ "container_sha256": "7ae7f6c06a6c8956b668d334c2b14ae9a7d94e9adc1bbbc89db3c30563b6510b",
+ "ids": "3,7,11,5,9,13,2,17,4,8,19,23,6,29,12,31",
+ "oracle": "uv run --with torch --no-project python tools/deepseek_ref.py --container <dir> --ids <ids> --dump tests/fixtures/oracle_ropesynth_16tok.bin",
+ "what": "Last token's logits, f32, vocab 256 \u2014 the layout test_forward writes. Computed by the PyTorch reference, not by the engine, so the diff means something.",
+ "why_the_digest": "Unlike the Kimi-Linear fixture this container is generated, not converted, so it is byte-reproducible at seed 0 and the fixture can ship. The digest is over that container: change make_test_container.py's weights and the fixture is stale, which has to read as 'regenerate me' and not as an engine bug."
+}

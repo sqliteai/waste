@@ -848,6 +848,92 @@ static int cfg_sane(const waste_config *c)
     return 1;
 }
 
+/* inv_freq for the rope dims, plus YaRN's factor on the attention scale.
+ *
+ * Both follow DeepseekV3YarnRotaryEmbedding. Two details do not survive
+ * paraphrase:
+ *   - mscale appears twice with different meanings. cos/sin carry
+ *     mscale / mscale_all_dim, which is 1 whenever the two are equal (K2 sets
+ *     both to 1), so they are left alone here. The attention scale carries
+ *     mscale_all_dim SQUARED, which is 1.8133x on K2.
+ *   - YaRN rescales inv_freq globally, so it applies from position 0. It is
+ *     not a long-context-only correction that a short prompt can ignore.
+ *
+ * A shape this does not implement leaves a reason in c->rope_err and the
+ * load refuses on it. Falling through to plain RoPE instead would be the
+ * same failure this function was added to fix: not a degraded answer but an
+ * unordered one, and one that looks like weight-shaped logits.
+ */
+static void rope_init(waste_config *c, const js_doc *d, int cfg)
+{
+    const double PI = 3.14159265358979323846;
+    c->att_mul = 1.0f;
+    c->rope_err[0] = 0;
+    /* By value, not by presence: a container carrying "mla_use_nope": false
+     * has to rotate. The presence idiom used for the other flags costs a
+     * feature when it misreads; here it costs the sequence order. */
+    c->mla_nope = js_bool(d, js_get(d, cfg, "mla_use_nope"), 0);
+    const int dim = c->qk_rope, half = dim / 2;
+    if (c->mla_nope || half <= 0) return;
+    if (half > WASTE_MAX_ROPE_HALF) {
+        snprintf(c->rope_err, sizeof c->rope_err,
+                 "qk_rope_head_dim %d needs rotation, this build holds %d",
+                 dim, 2 * WASTE_MAX_ROPE_HALF);
+        return;
+    }
+
+    const double base = js_num(d, js_get(d, cfg, "rope_theta"), 10000.0);
+    for (int j = 0; j < half; j++)
+        c->rope_inv_freq[j] = (float)(1.0 / pow(base, (double)(2 * j) / dim));
+
+    const int rs = js_get(d, cfg, "rope_scaling");
+    if (rs < 0) return;                     /* plain RoPE, computed above */
+    char type[24];
+    int ty = js_get(d, rs, "type");
+    if (ty < 0) ty = js_get(d, rs, "rope_type");   /* HF renamed the key */
+    js_str(d, ty, type, sizeof type);
+    if (strcmp(type, "yarn") != 0) {
+        snprintf(c->rope_err, sizeof c->rope_err,
+                 "rope_scaling type \"%s\" is not implemented, only yarn", type);
+        return;
+    }
+    /* factor <= 1 is not a refusal: YaRN's ramp is the identity there and
+     * both mscales collapse to 1, so plain RoPE is the right answer. */
+    const double factor = js_num(d, js_get(d, rs, "factor"), 1.0);
+    if (factor <= 1.0) return;
+    /* Unequal mscales put a ratio on cos/sin that nothing here applies.
+     * V3, R1, K2 and V2 all ship them equal; HF's defaults (1 and 0) are
+     * not, so an omitted mscale_all_dim lands here too. */
+    const double m_one = js_num(d, js_get(d, rs, "mscale"), 1.0);
+    const double m_dim = js_num(d, js_get(d, rs, "mscale_all_dim"), 0.0);
+    if (m_one != m_dim) {
+        snprintf(c->rope_err, sizeof c->rope_err,
+                 "rope_scaling mscale %g != mscale_all_dim %g, and the ratio "
+                 "on cos/sin is not implemented", m_one, m_dim);
+        return;
+    }
+
+    const double orig = js_num(d, js_get(d, rs, "original_max_position_embeddings"), 4096.0);
+    const double bf = js_num(d, js_get(d, rs, "beta_fast"), 32.0);
+    const double bs = js_num(d, js_get(d, rs, "beta_slow"), 1.0);
+    double low = floor(dim * log(orig / (bf * 2.0 * PI)) / (2.0 * log(base)));
+    double high = ceil(dim * log(orig / (bs * 2.0 * PI)) / (2.0 * log(base)));
+    if (low < 0.0) low = 0.0;
+    if (high > dim - 1) high = dim - 1;
+    if (low == high) high += 0.001;             /* upstream's singularity guard */
+    for (int j = 0; j < half; j++) {
+        double ramp = ((double)j - low) / (high - low);
+        ramp = ramp < 0.0 ? 0.0 : ramp > 1.0 ? 1.0 : ramp;
+        const double mask = 1.0 - ramp;         /* 1 = extrapolate, 0 = interpolate */
+        const double extra = c->rope_inv_freq[j];
+        c->rope_inv_freq[j] = (float)((extra / factor) * (1.0 - mask) + extra * mask);
+    }
+    if (m_dim != 0.0) {
+        const double ms = 0.1 * m_dim * log(factor) + 1.0;
+        c->att_mul = (float)(ms * ms);
+    }
+}
+
 static void cfg_from_json(waste_config *c, const js_doc *d, int cfg)
 {
     c->n_layers = (int)js_int(d, js_get(d, cfg, "num_hidden_layers"), 0);
@@ -891,6 +977,8 @@ static void cfg_from_json(waste_config *c, const js_doc *d, int cfg)
         if (a < 0) a = js_get(d, cfg, "architectures");
         js_str(d, js_at(d, a, 0), c->arch, sizeof c->arch);
     }
+
+    rope_init(c, d, cfg);
 
     int lac = js_get(d, cfg, "linear_attn_config");
     c->full_rank_gate = js_get(d, lac, "use_full_rank_gate") >= 0;
@@ -1034,6 +1122,14 @@ int waste_model_load(waste_model *m, const char *dir, int kv_cap,
                         "(%d layers, hidden %d, vocab %d, %d experts top-%d)\n",
                 m->cfg.n_layers, m->cfg.hidden, m->cfg.vocab,
                 m->cfg.n_experts, m->cfg.top_k);
+        js_free(&d); free(src);
+        return -2;                        /* -> WASTE_E_FORMAT */
+    }
+    /* rope_init leaves no table for a shape it does not implement. Running
+     * anyway would apply no rotation, which is not a degraded result but an
+     * unordered one, so refuse instead. */
+    if (m->cfg.rope_err[0]) {
+        fprintf(stderr, "waste: %s\n", m->cfg.rope_err);
         js_free(&d); free(src);
         return -2;                        /* -> WASTE_E_FORMAT */
     }
@@ -2373,6 +2469,34 @@ static void kda_layer(waste_model *m, int L, const float *in, float *out)
  * the absorption, the scores, the softmax and the output projection —
  * the old expanded path ran that loop on one core.
  */
+/* Rotate one qk_rope-wide slice in place at `pos`.
+ *
+ * GPT-J / interleaved: pair j is (x[2j], x[2j+1]). Upstream reaches the same
+ * arithmetic by de-interleaving before a half-split rotate,
+ *     q = q.view(b, h, s, d/2, 2).transpose(4, 3).reshape(b, h, s, d)
+ * so pairing dim j with dim j + qk_rope/2 instead — the LLaMA layout — rotates
+ * the wrong partners and still yields finite, weight-shaped output.
+ *
+ * The angles depend only on (pos, j), not on the head, so the caller builds
+ * the tables once per token per layer and every head reuses them. */
+static void rope_tables(const waste_config *c, int pos, float *cs, float *sn)
+{
+    for (int j = 0; j < c->qk_rope / 2; j++) {
+        const float a = (float)pos * c->rope_inv_freq[j];
+        cs[j] = cosf(a);
+        sn[j] = sinf(a);
+    }
+}
+
+static void rope_apply(int half, float *x, const float *cs, const float *sn)
+{
+    for (int j = 0; j < half; j++) {
+        const float e = x[2 * j], o = x[2 * j + 1];
+        x[2 * j]     = e * cs[j] - o * sn[j];
+        x[2 * j + 1] = e * sn[j] + o * cs[j];
+    }
+}
+
 typedef struct {
     waste_model *m;
     const waste_tensor *kvb;
@@ -2454,8 +2578,21 @@ static void mla_layer(waste_model *m, int L, const float *in, float *out, int po
              in, c->kv_lora + c->qk_rope, hid);
     waste_rmsnorm(ckv, ckv, T(m, "%smodel.layers.%d.self_attn.kv_a_layernorm.weight", c->prefix, L),
             c->kv_lora, c->eps);
-    /* Cache the latent as-is — normalized kpass followed by the raw rope
-     * dims. kv_b_proj is not applied here at all; it is absorbed below. */
+    /* Rotate before caching, not after: the cached entry is reused by every
+     * later query and carries this token's position, while the query carries
+     * the querying token's. Rotating on read would need the pair of positions
+     * and would redo the work once per (query, key). */
+    if (!c->mla_nope) {
+        float cs[WASTE_MAX_ROPE_HALF], sn[WASTE_MAX_ROPE_HALF];
+        rope_tables(c, pos, cs, sn);
+        const int half = c->qk_rope / 2;
+        for (int h = 0; h < nh; h++)
+            rope_apply(half, q + (size_t)h * qd + c->qk_nope, cs, sn);
+        rope_apply(half, ckv + c->kv_lora, cs, sn);
+    }
+    /* Cache the latent — normalized kpass followed by the rope dims, rotated
+     * unless the model is NoPE. kv_b_proj is not applied here at all; it is
+     * absorbed below. */
     memcpy(m->latcache[L] + (size_t)pos * latd, ckv, (size_t)latd * sizeof(float));
     /* WASTE_DUMP_LATENT=path appends the cached latent and the absorbed
      * query, the two things a KV-cache quantizer has to keep faithful. */
@@ -2475,7 +2612,9 @@ static void mla_layer(waste_model *m, int L, const float *in, float *out, int po
         a.S = m->n_kv[L]; a.qd = qd;
         a.qk_nope = c->qk_nope; a.qk_rope = c->qk_rope;
         a.vh = vh; a.kv_lora = c->kv_lora; a.latd = latd;
-        a.scale = 1.0f / sqrtf((float)qd);
+        /* YaRN raises the attention scale by mscale_all_dim^2 when the config
+         * sets it; att_mul is 1 otherwise, including on every NoPE model. */
+        a.scale = c->att_mul / sqrtf((float)qd);
         waste_parallel_for(nh, 1, mla_head_range, &a);
     }
     if (c->mla_output_gate) {

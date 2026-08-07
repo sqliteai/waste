@@ -82,6 +82,23 @@ CFG = {
 }
 C_KDA = H_KDA * D_KDA
 
+# --rope turns the above into a DeepSeek-V3 at the same scale, which is the
+# only shape that reaches src/model.c's rotary: the Kimi models set
+# mla_use_nope and pass the qk_rope dims through unrotated, so a container
+# built from CFG as it stands leaves rope_init and rope_apply dead.
+#
+# The rope block is Kimi-K2-Instruct's config.json verbatim. DeepSeek-V3 and
+# R1 ship the same shape with factor 40 and beta_fast 32; K2's beta_fast ==
+# beta_slow == 1.0 is the more awkward of the two because it collapses YaRN's
+# correction range to a two-dim ramp, so it is the one worth pinning.
+V3_ROPE = {
+    "rope_theta": 50000.0,
+    "rope_scaling": {"beta_fast": 1.0, "beta_slow": 1.0, "factor": 32.0,
+                     "mscale": 1.0, "mscale_all_dim": 1.0,
+                     "original_max_position_embeddings": 4096,
+                     "type": "yarn"},
+}
+
 
 def f32(vals):
     return struct.pack("<%df" % len(vals), *vals)
@@ -262,11 +279,49 @@ def main():
                     help="put the text tensors under a tensor_prefix, e.g. "
                          "language_model., and add one tensor outside it — "
                          "K3's shape, and the one the loader skips")
+    ap.add_argument("--rope", action="store_true",
+                    help="a DeepSeek-V3 instead of a Kimi-Linear: every layer "
+                         "MLA, no mla_use_nope, and rope_theta with YaRN — the "
+                         "only shape that reaches the engine's rotary")
+    ap.add_argument("--qk-rope", type=int, metavar="N",
+                    help="override qk_rope_head_dim. With --rope, a slice "
+                         "wider than the build's WASTE_MAX_ROPE_HALF pair "
+                         "table has to be refused at load, not run unrotated")
+    ap.add_argument("--nope-false", action="store_true",
+                    help="write mla_use_nope: false rather than omitting it. "
+                         "Same model either way — a loader that tests the key "
+                         "for presence reads it as NoPE and skips the rotation")
+    ap.add_argument("--rope-type", metavar="T",
+                    help="override rope_scaling.type, e.g. linear — a scaling "
+                         "the engine does not implement has to be refused, not "
+                         "quietly run as plain RoPE")
+    ap.add_argument("--mscale", type=float, metavar="X",
+                    help="override rope_scaling.mscale, leaving mscale_all_dim "
+                         "at 1.0. Unequal mscales put a ratio on cos/sin that "
+                         "the engine does not apply, so it refuses instead")
     args = ap.parse_args()
     rng = random.Random(args.seed)
     os.makedirs(args.out, exist_ok=True)
 
     cfg = dict(CFG)
+    if args.rope:
+        # Dropping linear_attn_config is what makes every layer MLA, so the
+        # rotation is exercised at depth rather than in the one full-attention
+        # layer the Kimi mix leaves. It also makes the container readable by
+        # tools/deepseek_ref.py, which — unlike kimi_ref.py — does not index
+        # linear_attn_config and does apply the rotary.
+        del cfg["mla_use_nope"], cfg["linear_attn_config"]
+        cfg["model_type"] = "deepseek_v3"
+        cfg["architectures"] = ["DeepseekV3ForCausalLM"]
+        cfg.update(V3_ROPE)
+        if args.nope_false:
+            cfg["mla_use_nope"] = False
+        if args.rope_type:
+            cfg["rope_scaling"] = dict(cfg["rope_scaling"], type=args.rope_type)
+        if args.mscale is not None:
+            cfg["rope_scaling"] = dict(cfg["rope_scaling"], mscale=args.mscale)
+    if args.qk_rope:
+        cfg["qk_rope_head_dim"] = args.qk_rope
     if args.tokenizer:
         # Every special has to be a real row of the embedding table and the
         # head: a container whose vocab_size stops short of its own specials
@@ -280,7 +335,7 @@ def main():
     qd = cfg["qk_nope_head_dim"] + cfg["qk_rope_head_dim"]
     kvl, rope = cfg["kv_lora_rank"], cfg["qk_rope_head_dim"]
     moe, dense = cfg["moe_intermediate_size"], cfg["intermediate_size"]
-    kda = {l - 1 for l in cfg["linear_attn_config"]["kda_layers"]}
+    kda = {l - 1 for l in cfg.get("linear_attn_config", {}).get("kda_layers", [])}
 
     t = Trunk(rng, args.prefix)
     t.quant("model.embed_tokens.weight", [cfg["vocab_size"], hid])

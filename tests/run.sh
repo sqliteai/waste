@@ -631,6 +631,149 @@ else
     sk "engine checks" "no container at $MODEL"
 fi
 
+# --------------------------------------------------------------- rotary ----
+head_ "rotary (MLA on a model that is not NoPE)"
+
+# Everything above this point runs on a Kimi, and every Kimi sets
+# mla_use_nope — so none of it reaches rope_init or rope_apply in
+# src/model.c. The rotation was absent from the engine for that reason and
+# the suite stayed green throughout, which is the failure this section
+# exists to stop repeating.
+#
+# It builds its own DeepSeek-V3-shaped container rather than using $MODEL,
+# so it runs on every host and does not depend on which weights happen to be
+# on disk. Nobody ships a V3 container yet — that needs the fp8 reader —
+# but the shape is what the engine branches on, and the shape is free.
+ROPE="$TMP/rope.waste"
+RIDS=3,7,11,5,9,13,2,17,4,8,19,23,6,29,12,31
+if ! python3 tools/make_test_container.py --rope --seed 0 "$ROPE" >/dev/null 2>&1; then
+    sk "rotary checks" "make_test_container.py --rope did not build a container"
+else
+    ./test_forward "$ROPE" "$RIDS" "$TMP/rope_seq.bin" 0 >/dev/null 2>&1
+    if [ ! -s "$TMP/rope_seq.bin" ]; then
+        no "the engine did not run a container without mla_use_nope"
+    else
+        # Same two-source shape as the Kimi oracle above: generate from the
+        # reference where torch is available, fall back to the fixture where
+        # it is not. This container is *generated* rather than converted, so
+        # unlike that one it is byte-reproducible at seed 0 and the fixture
+        # is portable — the digest below is what says so.
+        RGEN=""
+        if command -v uv >/dev/null 2>&1; then
+            uv run --no-project --with torch \
+                python tools/deepseek_ref.py --container "$ROPE" --ids "$RIDS" \
+                --dump "$TMP/rope_ref.bin" >/dev/null 2>&1 || true
+            [ -s "$TMP/rope_ref.bin" ] && RGEN="$TMP/rope_ref.bin"
+        fi
+        RFIX=tests/fixtures/oracle_ropesynth_16tok.bin
+        rope_why=""
+        if [ -z "$RGEN" ] && [ -f "${RFIX%.bin}.json" ]; then
+            rope_why=$(python3 - "$ROPE" "${RFIX%.bin}.json" <<'PY'
+import hashlib, json, os, sys
+h = hashlib.sha256()
+for n in sorted(os.listdir(sys.argv[1])):
+    h.update(n.encode())
+    h.update(open(os.path.join(sys.argv[1], n), "rb").read())
+want = json.load(open(sys.argv[2])).get("container_sha256")
+if want and h.hexdigest() != want:
+    print("no uv to generate one, and make_test_container.py --rope no "
+          "longer builds the container this fixture was made from — "
+          "regenerate it, see " + os.path.basename(sys.argv[2]))
+PY
+)
+        fi
+        if [ -n "$rope_why" ]; then
+            sk "engine vs the rotary oracle" "$rope_why"
+        elif [ -n "$RGEN" ] || [ -f "$RFIX" ]; then
+            if python3 - "$TMP/rope_seq.bin" "${RGEN:-$RFIX}" <<'PY'
+import struct, sys
+def L(p):
+    b = open(p, "rb").read()
+    return struct.unpack(f"<{len(b)//4}f", b)
+a, b = L(sys.argv[1]), L(sys.argv[2])
+sys.exit(0 if max(abs(x - y) for x, y in zip(a, b)) < 1e-3 else 1)
+PY
+            then
+                if [ -n "$RGEN" ]
+                then ok "rotated MLA matches a PyTorch oracle built from this container"
+                else ok "rotated MLA matches the shipped rotary fixture"
+                fi
+            # An engine that skips the rotation still produces finite,
+            # weight-shaped logits — that is why this went unnoticed — so the
+            # diff is the only thing that separates the two.
+            else no "rotated MLA diverges from the oracle"
+            fi
+        else
+            sk "engine vs the rotary oracle" \
+               "no fixture; regenerate with tools/deepseek_ref.py --dump"
+        fi
+
+        # The chunked check above runs on $MODEL, which is NoPE. mla_layer is
+        # per-token on both paths, so this should hold by construction — and
+        # it is exactly the kind of "by construction" that a later batched
+        # MLA would break silently.
+        WASTE_CHUNK=1 ./test_forward "$ROPE" "$RIDS" "$TMP/rope_chunk.bin" 0 >/dev/null 2>&1
+        if python3 - "$TMP/rope_seq.bin" "$TMP/rope_chunk.bin" <<'PY'
+import struct, sys
+def L(p):
+    b = open(p, "rb").read()
+    return struct.unpack(f"<{len(b)//4}f", b)
+a, b = L(sys.argv[1]), L(sys.argv[2])
+d = max(abs(x - y) for x, y in zip(a, b))
+sys.exit(0 if d < 1e-3 and a.index(max(a)) == b.index(max(b)) else 1)
+PY
+        then ok "chunked prefill == token-at-a-time with rotation"
+        else no "chunked prefill diverges on a rotated model"
+        fi
+
+        # Same model, same seed, one line of config: mla_use_nope written out
+        # as false instead of omitted. A loader that tests the key for
+        # presence reads that as NoPE and skips the rotation, which is the
+        # pre-fix engine — so these logits have to match the ones above.
+        FALSE="$TMP/rope_nopefalse.waste"
+        if ! python3 tools/make_test_container.py --rope --nope-false --seed 0 \
+             "$FALSE" >/dev/null 2>&1; then
+            sk "mla_use_nope: false rotates" "container not built"
+        else
+            ./test_forward "$FALSE" "$RIDS" "$TMP/rope_false.bin" 0 >/dev/null 2>&1
+            if [ -s "$TMP/rope_false.bin" ] && cmp -s "$TMP/rope_seq.bin" "$TMP/rope_false.bin"
+            then ok "mla_use_nope: false rotates, like the same model without the key"
+            else no "mla_use_nope: false was read as NoPE and skipped the rotation"
+            fi
+        fi
+    fi
+
+    # Shapes rope_init does not implement. Each has to be refused at load:
+    # running one would apply no rotation or the wrong one, and that is not a
+    # degraded answer but an unordered one.
+    rope_refused() {              # <what> <expected message> <container args...>
+        local what=$1 want=$2; shift 2
+        local dir="$TMP/rope_bad.waste"
+        rm -rf "$dir"
+        if ! python3 tools/make_test_container.py --rope "$@" "$dir" >/dev/null 2>&1; then
+            sk "$what is refused at load" "container not built"
+        # Read into a variable rather than piping: a refused load is a
+        # non-zero exit, which is the point, and under `set -o pipefail` that
+        # would sink the pipeline no matter what grep found.
+        elif printf '%s' "$(./test_forward "$dir" 3,7,11 "$TMP/bad.bin" 0 2>&1 || true)" \
+             | grep -q "$want"; then
+            ok "$what is refused at load"
+        else
+            no "$what loaded instead of being refused"
+        fi
+    }
+
+    # The rope table is a fixed WASTE_MAX_ROPE_HALF pairs.
+    rope_refused "a rope slice wider than the build holds" \
+                 "needs rotation" --qk-rope 132
+    # Anything but yarn — linear, dynamic — reaches none of the ramp below it.
+    rope_refused "an unimplemented rope_scaling type" \
+                 "not implemented, only yarn" --rope-type linear
+    # Unequal mscales put a ratio on cos/sin that rope_tables does not apply.
+    rope_refused "rope_scaling with mscale != mscale_all_dim" \
+                 "not implemented" --mscale 0.707
+fi
+
 # --------------------------------------------------------------- budget ----
 head_ "RAM budget"
 
