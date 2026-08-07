@@ -121,6 +121,8 @@ examples:
                         "since. Costs ~5%% on Kimi-Linear, ~1%% on K3")
     g.add_argument("--usage", default=None, metavar="PATH",
                    help="learned hotlist (default <model>/usage.waste)")
+    g.add_argument("--allow-concurrent-open", action="store_true",
+                   help="permit another process to load the same container")
 
     s = ap.add_argument_group("serving")
     s.add_argument("--max-tokens", type=bounded_int(1, (1 << 32) - 1),
@@ -177,7 +179,8 @@ examples:
             direct_io=not args.no_direct_io,
             vision=args.vision,
             verify_records=args.verify,
-            usage_path=args.usage)
+            usage_path=args.usage,
+            allow_concurrent_open=args.allow_concurrent_open)
     except EngineError as e:
         print(f"{e}", file=sys.stderr)
         # Two statuses that say nothing useful on their own when --cpus is

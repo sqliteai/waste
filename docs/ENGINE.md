@@ -23,6 +23,27 @@ state save/load, model introspection and aggregate stats.
 Deliberately *not* in the API: logging to stdout, signal handlers, config
 files, argument parsing. Those belong to the host — the CLI included.
 
+### Container ownership
+
+On POSIX hosts, the first `waste_open` takes a non-blocking advisory lock on
+the container directory before memory planning or model-sized allocation. A
+different process opening the same container receives `WASTE_E_BUSY`; it does
+not wait while both processes allocate the model and discover the collision
+through memory pressure. Paths are matched by device and inode, so aliases of
+one directory do not evade the check.
+
+Contexts in one process remain independent as documented: they share a
+reference-counted ownership entry, and the last `waste_close` releases it.
+Failures during planning, budget validation, or partial model loading release
+it as well. Lock descriptors are close-on-exec, and a forked child is treated
+as a different process rather than inheriting the parent's registry.
+
+An embedding host that deliberately accepts competing model loads can set
+`waste_cfg.allow_concurrent_open`. The CLI and server expose the same opt-out
+as `--allow-concurrent-open`. This is an advisory lock between cooperating
+WASTE processes and depends on the filesystem's `flock` support; Windows keeps
+its existing lifecycle behavior and ignores the setting.
+
 ## 2. CLI as a first-class client
 
 `cli/` links the library and adds only host concerns: argv parsing, a

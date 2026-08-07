@@ -112,7 +112,7 @@ typedef struct {
     uint64_t budget;
     uint32_t ctx, max_tokens;
     float temperature, top_p;
-    int top_k, threads, quiet, learn, json, no_echo;
+    int top_k, threads, quiet, learn, json, no_echo, allow_concurrent;
     int media_inlined;              /* the media block is already in the
                                        prompt string, inside the user turn */
     uint64_t seed;
@@ -190,6 +190,7 @@ static int parse_opts(int argc, char **argv, int from, opts *o)
         else if (!strcmp(a, "--json")) o->json = 1;
         else if (!strcmp(a, "--raw")) o->raw = 1;
         else if (!strcmp(a, "--verify")) o->verify = 1;
+        else if (!strcmp(a, "--allow-concurrent-open")) o->allow_concurrent = 1;
         else if (!strcmp(a, "-")) {                /* explicit stdin */
             if (o->n_pos >= MAX_POS) { fprintf(stderr, "too many arguments\n"); return -1; }
             o->pos[o->n_pos++] = "-";
@@ -273,6 +274,7 @@ static waste_status open_model(const char *path, const opts *o, waste_ctx **ctx)
      * Kimi-Linear. Worth it for a container that was copied or downloaded
      * and has not been read since. */
     cfg.verify_records = o->verify;
+    cfg.allow_concurrent_open = o->allow_concurrent;
     const waste_status st = waste_open(path, &cfg, ctx);
     /* Two statuses that say nothing useful on their own when --cpus is
      * what produced them, and it usually is: nothing else here can be
@@ -1220,6 +1222,7 @@ int main(int argc, char **argv)
                "options: --budget 8G  --ctx N  -n N  --temp F  --top-p F\n"
                "         --top-k N  --seed N  --threads N  --cpus LIST\n"
                "         --stop STR  --file F  --json  -q  --learn  --verify\n"
+               "         --allow-concurrent-open\n"
          "  --stop  ends generation when the text appears\n"
          "  --json  machine-readable output for eval, tokenize, plan,\n"
          "          info and bench\n"
@@ -1231,6 +1234,7 @@ int main(int argc, char **argv)
          "  the cores differ: on a two-die Ryzen, six threads on one die\n"
          "  measured 16-25%% faster than six split across both. Linux and\n"
          "  Windows; the default is to leave placement to the OS\n"
+         "  --allow-concurrent-open opts out of the POSIX container lock\n"
          "  --verify checks each expert record's checksum as it is read,\n"
          "  for a container you have not read since copying it. Costs ~5%%\n"
          "  on Kimi-Linear, ~1%% on K3; off otherwise\n",
